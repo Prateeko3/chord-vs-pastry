@@ -317,7 +317,7 @@ clerk using the same rules, so the comparison is fair.
 
 | File | Class / function | What it does |
 |---|---|---|
-| `sim/topology.py` | `UniformSquare`, `Clustered`, `Homogeneous` | Place a node (`sample_position(rng)`) and give the one-way latency between two positions (`latency(p, q)`). `bind(rng)` fixes random layout choices (cluster centres) for one seed and returns a new object, so the original spec can be reused. |
+| `sim/topology.py` | `UniformSquare`, `Clustered`, `Homogeneous` | Place a node (`sample_position(rng)`) and give the one-way latency between two positions (`latency(p, q)`). `setup(rng)` fixes random layout choices (cluster centres) for one seed and returns a new object, so the original spec can be reused. |
 | `sim/network.py` | `Message` | One message: `src`, `dst`, `kind`, `payload`, `tag`, plus RPC bookkeeping (`expects_reply`, `is_reply`, `reply_to`). |
 | | `Network` | Owns the simpy `env`, all nodes and the metrics. `create_node(cls)` assigns an address (0, 1, 2, …) and a position. `send(msg)` counts the message, maybe drops it (loss), then schedules delivery after `latency + jitter`. On arrival it drops the message if the destination is dead, otherwise calls `node.receive(msg)`. |
 | `sim/node.py` | `BaseNode` | `send` (one-way), `rpc` (request, wait, reply or `RpcTimeout`), `receive` (dispatch to `handle_<kind>`), `spawn` (start a process that ends quietly if the node crashes), `run_periodically` (randomised repeating task), `fail` (crash). Also declares `join/leave/lookup/routing_state_size`, which Chord and Pastry must implement. |
@@ -332,7 +332,7 @@ a.rpc(b, "ping")                         a's process pauses here ─────
   └─ Network.send(msg)                                                 │
        ├─ metrics.on_send   (counted, even if it is then lost)         │
        ├─ lost? (random < loss_rate)  → gone; a will time out          │
-       └─ env.timeout(latency + jitter) ──► Network._arrive(msg)       │
+       └─ env.timeout(latency + jitter) ──► Network.arrive(msg)       │
                                               ├─ b dead? → dropped     │
                                               └─ b.receive(msg)        │
                                                    └─ b.handle_ping(msg) returns "pong"
@@ -533,7 +533,7 @@ What the Phase 1 tests check:
 - **Topologies:** uniform positions stay in bounds; clustered nodes sit
   near a centre; homogeneous latency is constant; the same seed gives
   an identical simulation and a different seed gives a different one; the
-  topology spec isn't modified by binding.
+  topology object isn't modified by `setup()`.
 - **Metrics:** counts by kind and tag (replies inherit the tag); `percentile`
   equals numpy's; `summarize` handles empty input; `lookup_summary` excludes
   failed lookups from hops and latency; `reset` clears everything.
@@ -656,9 +656,9 @@ slower for a while, and the street was fully repaired within a minute.
 
 | Paper | Here | Kind of message |
 |---|---|---|
-| `find_successor(id)` | `_find_successor()` → shared `OverlayNode.route()`; Chord's `next_hop()` picks each step (since Phase 3, see §3.1 there) | `route` (+ `route.reply` = ack), `route_done` |
-| `closest_preceding_node(id)` | `_closest_preceding()` | local |
-| `join(n')` | `join()` + `_init_fingers()` | tag `join` |
+| `find_successor(id)` | `find_successor()` → shared `OverlayNode.route()`; Chord's `next_hop()` picks each step (since Phase 3, see §3.1 there) | `route` (+ `route.reply` = ack), `route_done` |
+| `closest_preceding_node(id)` | `closest_preceding_node()` | local |
+| `join(n')` | `join()` + `init_fingers()` | tag `join` |
 | `stabilize()` / `notify(n')` | `stabilize()` / `handle_notify()` | `get_neighbors`, `notify` |
 | `fix_fingers()` | `fix_fingers()` | `route` … |
 | `check_predecessor()` | `check_predecessor()` | `ping` |
@@ -691,7 +691,7 @@ At node n, for key k:
 
 1. If k ∈ (pred(n), n], **I own it**: send `route_done` to the origin.
 2. Else if k ∈ (n, successor], **my successor owns it**: forward with `final = True`.
-3. Else forward to `closest_preceding(k)`: among my fingers *and* successor
+3. Else forward to `closest_preceding_node(k)`: among my fingers *and* successor
    list, the node in (n, k) furthest from me.
 
 **Why it terminates.** In step 3 the next node is strictly inside (n, k),
@@ -803,7 +803,7 @@ Theorem 4 (stabilization eventually fixes concurrent joins) covers.
 - **Crash:** the node just stops. Neighbours detect it by timeouts:
   `stabilize` skips a dead successor and uses the next one in the list;
   `check_predecessor` clears a dead predecessor; any RPC timeout calls
-  `_forget()`, which removes the node from all state.
+  `forget()`, which removes the node from all state.
 - **Why a successor list of r = 8?** The ring only breaks if all r successors
   of some node fail together. If a fraction p of nodes fail independently,
   that has probability ≈ pʳ per node. For p = 0.25 that's 1.5 × 10⁻⁵, so
@@ -876,7 +876,7 @@ What the 24 Phase 2 tests check:
   16-slot ring; the same seed gives identical lookups.
 
 **Mutation check** (are the tests strong enough?):
-1. Making `closest_preceding` pick the *nearest* finger (no halving):
+1. Making `closest_preceding_node` pick the *nearest* finger (no halving):
    9 tests failed.
 2. Making `notify` accept *any* predecessor: **no test failed at first**,
    because the ring heals eventually and the convergence tests only look at
@@ -946,7 +946,7 @@ measure correctness *during* churn instead of assuming it.
 
 **Q11. What did you change from the paper?**
 See the table in §3.8: m = 32 instead of 160, recursive routing with acks,
-a (pred, n] ownership check, successor-list-aware `closest_preceding`, no
+a (pred, n] ownership check, successor-list-aware `closest_preceding_node`, no
 `update_others` at join, randomised timers, r = 8, and no virtual nodes.
 
 ---
@@ -1022,9 +1022,9 @@ about them).
 | `digit(id, row)`, `shl(a, b)`, `dist(a, b)` | A digit of an ID, shared-prefix length, circular numeric distance |
 | `next_hop(p)` | The paper's Table 1 routing rule |
 | `consider(refs, leaf=True)` | Learn about nodes: each part of the state keeps a node only if it's better (numerically closer for L, physically closer for R and M) |
-| `offer_gossip(refs)` | Second-hand nodes are pinged before entering the leaf set (§3.6) |
+| `check_and_add_leaves(refs)` | Second-hand nodes are pinged before entering the leaf set (§3.6) |
 | `join()`, `on_visit()`, `deliver()` | Join protocol: the join message collects state along its route |
-| `forget()` + `_repair_leaf / _repair_table_slot / _repair_neighborhood` | The paper's failure repair procedures |
+| `forget()` + `repair_leaf / repair_table_slot / repair_neighborhood` | The paper's failure repair procedures |
 | `maintain()` | Periodic keep-alive round |
 | `leave()` / `handle_leaving()` | Graceful departure (an addition) |
 
@@ -1196,7 +1196,7 @@ instead of merging into it.
 2. Unlimited memory: converges, but under message loss a *live* node that
    misses one ping would be locked out permanently. Rejected.
 3. **Ping before insert (chosen):** a second-hand node may enter the leaf
-   set only after it answers a ping (`offer_gossip`). The 30 s memory is kept
+   set only after it answers a ping (`check_and_add_leaves`). The 30 s memory is kept
    to avoid pinging the same dead node repeatedly. A wrongly suspected live
    node gets back in after one successful ping. Later Pastry versions use
    the same idea of probing before adding.

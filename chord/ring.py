@@ -1,117 +1,134 @@
-"""Helpers for building and checking Chord rings. EXPERIMENT/TEST CODE ONLY.
+"""Helper functions for tests and experiments with Chord.
 
-These functions look at *every* node at once (a "god's-eye view"). Real Chord
-nodes never can, and ChordNode never calls anything in this file. We use the
-global view for three things:
+These look at all nodes at once, which a real node can't do. The nodes never
+call anything from this file, only the tests and experiment scripts do.
 
-  1. create_nodes()  make N nodes with guaranteed-unique IDs.
-  2. build_static()  give every node perfectly correct state instantly, as if
-                     the ring had been stable forever. That lets us measure
-                     lookup performance on 5,000 nodes without simulating
-                     5,000 joins. (Dynamic joins are tested separately.)
-  3. Oracle / check_ring() / finger_accuracy(): the ground truth to compare
-                     lookup answers and routing state against.
+  create_nodes   - make n nodes with different IDs
+  build_static   - set up correct fingers/successors for every node directly,
+                   as if the ring was already stable. This is much faster than
+                   doing thousands of joins when we only want to test lookups.
+  Oracle         - knows the real owner of every key, to check lookups
+  check_ring, finger_accuracy - check if the routing state is correct
 """
 
-from __future__ import annotations
-
 import bisect
-from typing import Iterable
 
-from chord.node import ChordNode, NodeRef
+from chord.node import ChordNode
 from sim.ids import hash_to_id
-from sim.metrics import LookupRecord
-from sim.network import Network
 
 
-def create_nodes(net: Network, n: int, **node_kwargs) -> list[ChordNode]:
-    """Create n ChordNodes with distinct IDs. With m=32 and a few thousand
-    nodes a SHA-1 collision is very unlikely, but if one happens we re-hash
-    with a salt rather than silently putting two nodes on one ID."""
-    nodes: list[ChordNode] = []
-    used: set[int] = set()
-    for _ in range(n):
-        node = net.create_node(ChordNode, **node_kwargs)
+def create_nodes(net, n, **node_args):
+    """Create n Chord nodes. If two nodes get the same ID (very unlikely
+    with m = 32) we hash again with a salt."""
+    nodes = []
+    used = set()
+    for i in range(n):
+        node = net.create_node(ChordNode, **node_args)
         salt = 0
         while node.id in used:
             salt += 1
-            node.set_id(hash_to_id(f"chord-node:{net.seed}:{node.address}:{salt}", node.m))
+            text = "chord-node:" + str(net.seed) + ":" + str(node.address) + ":" + str(salt)
+            node.set_id(hash_to_id(text, node.m))
         used.add(node.id)
         nodes.append(node)
     return nodes
 
 
 class Oracle:
-    """Ground truth: which live node really owns each key."""
+    """Knows which live node really owns each key."""
 
-    def __init__(self, nodes: Iterable[ChordNode]):
-        live = sorted((n for n in nodes if n.alive), key=lambda n: n.id)
-        if not live:
+    def __init__(self, nodes):
+        live = [n for n in nodes if n.alive]
+        if len(live) == 0:
             raise ValueError("no live nodes")
+        live.sort(key=lambda n: n.id)
         self.ring = live
         self.ids = [n.id for n in live]
         self.m = live[0].m
 
-    def successor(self, ident: int) -> ChordNode:
-        """First node with ID >= ident, wrapping round to the smallest ID."""
+    def successor(self, ident):
+        """First node with ID >= ident (goes back to the start if needed)."""
         i = bisect.bisect_left(self.ids, ident)
         return self.ring[i % len(self.ring)]
 
-    def owner_of_key(self, key: str) -> ChordNode:
+    def owner_of_key(self, key):
         return self.successor(hash_to_id(key, self.m))
 
-    def index(self, node: ChordNode) -> int:
+    def index(self, node):
         return bisect.bisect_left(self.ids, node.id)
 
-    def check(self, record: LookupRecord) -> bool:
-        """Mark a LookupRecord correct/incorrect and return the verdict."""
+    def check(self, record):
+        """Set record.correct and return it."""
         record.correct = record.success and record.owner == self.owner_of_key(record.key).address
         return record.correct
 
 
-def build_static(nodes: list[ChordNode]) -> None:
-    """Give every live node the exact state of a fully stabilized ring."""
+def build_static(nodes):
+    """Give every live node the correct state of a stable ring."""
     oracle = Oracle(nodes)
-    ring, n = oracle.ring, len(oracle.ring)
-    for idx, node in enumerate(ring):
-        node.predecessor = ring[idx - 1].ref if n > 1 else None
-        node.successors = ([ring[(idx + k) % n].ref for k in range(1, min(node.r, n - 1) + 1)]
-                           or [node.ref])
+    ring = oracle.ring
+    n = len(ring)
+    for idx in range(n):
+        node = ring[idx]
+        if n > 1:
+            node.predecessor = ring[idx - 1].ref
+        else:
+            node.predecessor = None
+        succ_list = []
+        for k in range(1, min(node.r, n - 1) + 1):
+            succ_list.append(ring[(idx + k) % n].ref)
+        if len(succ_list) == 0:
+            succ_list = [node.ref]
+        node.successors = succ_list
         for i in range(node.m):
             f = oracle.successor(node.finger_start(i))
-            node.fingers[i] = f.ref if f is not node else None
+            if f is node:
+                node.fingers[i] = None
+            else:
+                node.fingers[i] = f.ref
         node.joined = True
 
 
-def check_ring(nodes: list[ChordNode]) -> list[str]:
-    """List every live node whose successor or predecessor is wrong.
-    An empty list means the ring is fully correct."""
+def check_ring(nodes):
+    """Returns a list of problems (wrong successor / predecessor / successor
+    list). Empty list = ring is correct."""
     oracle = Oracle(nodes)
-    ring, n = oracle.ring, len(oracle.ring)
+    ring = oracle.ring
+    n = len(ring)
     errors = []
-    for idx, node in enumerate(ring):
+    for idx in range(n):
+        node = ring[idx]
         want_succ = ring[(idx + 1) % n].ref
-        want_pred = ring[idx - 1].ref if n > 1 else None
+        if n > 1:
+            want_pred = ring[idx - 1].ref
+        else:
+            want_pred = None
         if n > 1 and node.successor != want_succ:
-            errors.append(f"{node}: successor {node.successor} should be {want_succ}")
+            errors.append("%s: successor %s should be %s" % (node, node.successor, want_succ))
         if node.predecessor != want_pred:
-            errors.append(f"{node}: predecessor {node.predecessor} should be {want_pred}")
-        want_list = [ring[(idx + k) % n].ref for k in range(1, min(node.r, n - 1) + 1)]
+            errors.append("%s: predecessor %s should be %s" % (node, node.predecessor, want_pred))
+        want_list = []
+        for k in range(1, min(node.r, n - 1) + 1):
+            want_list.append(ring[(idx + k) % n].ref)
         if n > 1 and node.successors != want_list:
-            errors.append(f"{node}: successor list wrong")
+            errors.append("%s: successor list wrong" % node)
     return errors
 
 
-def finger_accuracy(nodes: list[ChordNode]) -> float:
-    """Fraction of finger entries (over all live nodes) that equal the true
-    successor(n + 2^i). A None entry counts as correct only if the true
-    answer is the node itself."""
+def finger_accuracy(nodes):
+    """Fraction of finger entries that are correct. A None entry is correct
+    only when the real successor(n + 2^i) is the node itself."""
     oracle = Oracle(nodes)
-    good = total = 0
+    good = 0
+    total = 0
     for node in oracle.ring:
         for i in range(node.m):
-            true = oracle.successor(node.finger_start(i))
-            expected: NodeRef | None = None if true is node else true.ref
-            good += node.fingers[i] == expected
+            real = oracle.successor(node.finger_start(i))
+            if real is node:
+                expected = None
+            else:
+                expected = real.ref
+            if node.fingers[i] == expected:
+                good += 1
             total += 1
     return good / total

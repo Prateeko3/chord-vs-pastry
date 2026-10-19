@@ -1,19 +1,15 @@
-"""Phase 0 demo: why DHTs use *consistent* hashing instead of `hash % N`.
+"""Phase 0 demo: why DHTs use consistent hashing and not hash % N.
 
-We place K keys on N servers using two strategies, then add ONE server and
-count how many keys have to move to a different server.
-
-  1. Naive modulo hashing:   server = hash(key) % N
-  2. Consistent hashing:     put servers and keys on a ring of IDs; each key
-                             belongs to the first server clockwise from it
-                             (its "successor"), exactly as in Chord.
+We put K keys on N servers in two ways, then add one server and count how
+many keys have to move:
+  1. modulo hashing:      server = hash(key) % N
+  2. consistent hashing:  servers and keys on a ring, each key goes to the
+                          first server clockwise from it (like Chord)
 
 Run:
     python -m experiments.phase0_consistent_hashing_demo
     python -m experiments.phase0_consistent_hashing_demo --servers 100 --keys 50000 --seed 7
 """
-
-from __future__ import annotations
 
 import argparse
 import bisect
@@ -21,60 +17,73 @@ import bisect
 from sim.ids import hash_to_id
 from sim.rng import make_rng
 
-ID_BITS = 32  # a small ring is plenty for a demo
+ID_BITS = 32   # small ring is enough for this demo
 
 
-def assign_modulo(keys: list[str], n_servers: int) -> dict[str, int]:
-    """Naive strategy: server index = hash(key) mod N."""
-    return {k: hash_to_id(k, ID_BITS) % n_servers for k in keys}
-
-
-def assign_consistent(keys: list[str], server_names: list[str]) -> dict[str, str]:
-    """Ring strategy: each key goes to the first server ID >= the key's ID,
-    wrapping around to the smallest server ID if needed."""
-    ring = sorted((hash_to_id(s, ID_BITS), s) for s in server_names)
-    ring_ids = [rid for rid, _ in ring]
+def assign_modulo(keys, n_servers):
+    """server number = hash(key) mod N"""
     owner = {}
     for k in keys:
-        kid = hash_to_id(k, ID_BITS)
-        i = bisect.bisect_left(ring_ids, kid)   # first server ID >= kid
-        owner[k] = ring[i % len(ring)][1]       # % len wraps past the top of the ring
+        owner[k] = hash_to_id(k, ID_BITS) % n_servers
     return owner
 
 
-def run(n_servers: int, n_keys: int, seed: int) -> dict[str, float]:
+def assign_consistent(keys, server_names):
+    """Each key goes to the first server with ID >= key ID (wraps around)."""
+    ring = []
+    for s in server_names:
+        ring.append((hash_to_id(s, ID_BITS), s))
+    ring.sort()
+    ring_ids = [r[0] for r in ring]
+    owner = {}
+    for k in keys:
+        kid = hash_to_id(k, ID_BITS)
+        i = bisect.bisect_left(ring_ids, kid)
+        owner[k] = ring[i % len(ring)][1]   # % len(ring) goes back to the start
+    return owner
+
+
+def run(n_servers, n_keys, seed):
     rng = make_rng(seed, "phase0-demo")
-    # Random key names (seeded, so the run is reproducible).
-    keys = [f"key-{rng.getrandbits(64):016x}" for _ in range(n_keys)]
-    # Server names also come from the seed, so each seed gives a different
-    # ring layout (otherwise every seed would test the same ring).
-    servers = [f"server-{rng.getrandbits(64):016x}" for _ in range(n_servers + 1)]
+    keys = []
+    for i in range(n_keys):
+        keys.append(f"key-{rng.getrandbits(64):016x}")
+    # server names also depend on the seed, so each seed gives a different ring
+    servers = []
+    for i in range(n_servers + 1):
+        servers.append(f"server-{rng.getrandbits(64):016x}")
     new_server = servers.pop()
 
     before_mod = assign_modulo(keys, n_servers)
     after_mod = assign_modulo(keys, n_servers + 1)
-    moved_mod = sum(before_mod[k] != after_mod[k] for k in keys)
+    moved_mod = 0
+    for k in keys:
+        if before_mod[k] != after_mod[k]:
+            moved_mod += 1
 
     before_ring = assign_consistent(keys, servers)
     after_ring = assign_consistent(keys, servers + [new_server])
-    moved_ring = sum(before_ring[k] != after_ring[k] for k in keys)
+    moved_ring = 0
+    for k in keys:
+        if before_ring[k] != after_ring[k]:
+            moved_ring += 1
 
     return {
         "moved_modulo_pct": 100.0 * moved_mod / n_keys,
         "moved_consistent_pct": 100.0 * moved_ring / n_keys,
-        "ideal_pct": 100.0 / (n_servers + 1),  # the new server's fair share
+        "ideal_pct": 100.0 / (n_servers + 1),   # fair share of the new server
     }
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--servers", type=int, default=10)
-    p.add_argument("--keys", type=int, default=20000)
-    p.add_argument("--seed", type=int, default=42)
-    a = p.parse_args()
+def main():
+    parser = argparse.ArgumentParser(description="Phase 0 demo: modulo vs consistent hashing")
+    parser.add_argument("--servers", type=int, default=10)
+    parser.add_argument("--keys", type=int, default=20000)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
 
-    r = run(a.servers, a.keys, a.seed)
-    print(f"Adding 1 server to {a.servers} servers holding {a.keys} keys (seed={a.seed}):")
+    r = run(args.servers, args.keys, args.seed)
+    print(f"Adding 1 server to {args.servers} servers holding {args.keys} keys (seed={args.seed}):")
     print(f"  modulo hashing     : {r['moved_modulo_pct']:6.2f}% of keys moved")
     print(f"  consistent hashing : {r['moved_consistent_pct']:6.2f}% of keys moved")
     print(f"  ideal (1/(N+1))    : {r['ideal_pct']:6.2f}%")

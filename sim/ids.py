@@ -1,60 +1,36 @@
-"""Turning names and keys into numeric identifiers (consistent hashing basics).
+"""Hashing names/keys to IDs, and the ring interval check used by Chord.
 
-Both Chord and Pastry give every node and every key an identifier (ID) taken
-from the same huge number space, by running a cryptographic hash (SHA-1) over
-something: a node's address, or a key's name.
-
-- Chord uses an m-bit space: IDs are 0 .. 2**m - 1 arranged on a circle.
-- Pastry uses 128-bit IDs written in base 2**b (b = 4 -> hexadecimal digits).
-
-SHA-1 outputs 160 bits. To get an m-bit ID we keep the top m bits. Because
-SHA-1's output looks uniformly random, IDs spread evenly around the space,
-which is what gives DHTs their load balance.
-
-Note: SHA-1 is no longer considered secure for cryptography, but here we only
-need "spreads inputs evenly and deterministically", which it still does. We
-use it because both original papers do.
+Both papers use SHA-1. SHA-1 gives 160 bits; if we want an m-bit ID we keep
+the top m bits. Chord uses m-bit IDs on a ring, Pastry uses 128-bit IDs.
+(SHA-1 is not secure anymore but we only need it to spread IDs evenly.)
 """
-
-from __future__ import annotations
 
 import hashlib
 
 SHA1_BITS = 160
 
 
-def sha1_int(data: str | bytes) -> int:
-    """Return the full 160-bit SHA-1 hash of `data` as a Python integer."""
+def sha1_int(data):
+    """SHA-1 of a string (or bytes) as a big integer."""
     if isinstance(data, str):
         data = data.encode("utf-8")
     return int.from_bytes(hashlib.sha1(data).digest(), "big")
 
 
-def hash_to_id(data: str | bytes, bits: int) -> int:
-    """Hash `data` into an identifier in the range [0, 2**bits).
-
-    We keep the most significant `bits` bits of the SHA-1 digest (shifting
-    away the rest). For bits=160 this is the full digest.
-    """
-    if not 1 <= bits <= SHA1_BITS:
-        raise ValueError(f"bits must be between 1 and {SHA1_BITS}, got {bits}")
+def hash_to_id(data, bits):
+    """Hash data to an ID between 0 and 2^bits - 1 (keeps the top bits)."""
+    if bits < 1 or bits > SHA1_BITS:
+        raise ValueError("bits must be between 1 and 160, got " + str(bits))
     return sha1_int(data) >> (SHA1_BITS - bits)
 
 
-def in_interval(x: int, a: int, b: int, *, inclusive_right: bool = False,
-                inclusive_left: bool = False) -> bool:
-    """Is x inside the interval from a to b going *clockwise* around the ring?
+def in_interval(x, a, b, inclusive_right=False, inclusive_left=False):
+    """Check if x is between a and b going clockwise on the ring.
 
-    On a ring, the interval (a, b) "wraps around" when a > b. For example on a
-    ring of size 64, the interval (60, 4) contains 61, 62, 63, 0, 1, 2, 3.
-    Chord uses this test constantly ("is the key between me and my
-    successor?"), so we write it once here and test it carefully.
-
-    By default both ends are open: (a, b). Set inclusive_right for (a, b],
-    inclusive_left for [a, b).
-
-    Special case a == b: the open interval (a, a) means "the whole ring
-    except a" (this is how Chord treats a ring with a single node).
+    By default the interval is open (a, b). If a > b the interval wraps
+    around zero, e.g. on a ring of size 64, (60, 4) = {61, 62, 63, 0, 1, 2, 3}.
+    If a == b, (a, a) means the whole ring except a (Chord uses this when
+    there is only one node).
     """
     if inclusive_left and x == a:
         return True
@@ -64,5 +40,5 @@ def in_interval(x: int, a: int, b: int, *, inclusive_right: bool = False,
         return x != a
     if a < b:
         return a < x < b
-    # Wrapping case: a > b, the interval passes through 0.
+    # a > b so the interval goes past 0
     return x > a or x < b

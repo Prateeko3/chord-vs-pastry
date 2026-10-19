@@ -1,165 +1,162 @@
-"""Recursive routing machinery shared by Chord and Pastry.
+"""Routing code that Chord and Pastry share.
 
-Both overlays route a message hop by hop towards the node responsible for a
-key. The *only* thing that differs between them is how each node picks the
-next hop. So the forwarding mechanics live here, written once:
+Both overlays forward a message hop by hop until it reaches the node that is
+responsible for the key. Only the choice of the next hop is different, so
+the rest is written once here and both use it:
 
-    origin --route--> hop1 --route--> hop2 ... --route--> owner
-       ^                                                    |
-       +------------------- route_done ---------------------+
+    origin -> hop1 -> hop2 -> ... -> owner
+       ^                              |
+       +--------- route_done ---------+
 
-- Each "route" message is an RPC whose reply is an immediate "ack". If no ack
-  arrives within HOP_TIMEOUT, the forwarder calls forget(next_hop) and asks
-  next_hop() again (which now picks a different node).
-- The node where next_hop() returns None is the destination ("owner"). It
-  runs deliver() (used by the key-value store in Phase 4) and sends
-  "route_done" straight back to the origin.
-- `hops` counts forwarding steps from the origin to the owner, for both
-  overlays identically.
+Every forward is an rpc and the next node answers "ack" right away. If there
+is no ack within HOP_TIMEOUT we think that node is dead, call forget() on it
+and try another next hop. The owner sends "route_done" directly back to the
+node that started the lookup. hops = number of forwards until the owner.
 
-This shared code is a fairness guarantee: timeouts, retries, acks, hop
-counting and latency accounting can't differ between Chord and Pastry.
-
-A subclass must provide:
-    key_id(key)      map an application key (str) into its ID space
-    next_hop(p)      (NodeRef, extra_fields) to forward, or None = "it's me"
-    forget(addr)     remove a node believed dead from all routing state
-and may override:
-    on_visit(p)      inspect/extend the message at each node (Pastry's join
-                     uses this to collect routing-table rows along the path)
-    deliver(p)       compute a result at the destination
+Chord and Pastry have to write:
+    key_id(key)    turn a key string into an ID
+    next_hop(p)    return (next node, extra fields) or None if we are the owner
+    forget(addr)   remove a dead node from our tables
+and they can also change:
+    on_visit(p)    look at the message at each node (Pastry join uses it)
+    deliver(p)     the result computed at the owner
 """
 
-from __future__ import annotations
-
-from typing import Any, Generator, NamedTuple
+from collections import namedtuple
 
 from sim.metrics import LookupRecord
 from sim.node import BaseNode, NodeCrashed, RpcTimeout
 
-
-class NodeRef(NamedTuple):
-    """How one node refers to another: its overlay ID and network address.
-    Immutable, so passing refs between nodes can't create shared mutable
-    state by accident."""
-    id: int
-    addr: int
+# How one node stores another node: its ID and its network address.
+NodeRef = namedtuple("NodeRef", ["id", "addr"])
 
 
 class OverlayNode(BaseNode):
-    HOP_TIMEOUT = 500.0        # ms to wait for a per-hop ack
-    LOOKUP_TIMEOUT = 10_000.0  # ms the origin waits for the final answer
-    MAX_HOPS = 64              # safety net against loops in broken states
-    MAX_HOP_ATTEMPTS = 8       # dead next hops one node will skip before giving up
-
-    # Set by subclasses in __init__:
-    id: int
-    ref: NodeRef
+    HOP_TIMEOUT = 500.0        # ms to wait for the ack of one hop
+    LOOKUP_TIMEOUT = 10000.0   # ms the origin waits for the answer
+    MAX_HOPS = 64              # stop if a route goes on too long (loop)
+    MAX_HOP_ATTEMPTS = 8       # how many dead next hops we try to skip
 
     def __init__(self, network, address, position):
-        super().__init__(network, address, position)
-        # Routes this node started and is waiting on: lookup id -> event.
-        self._waiting: dict[int, Any] = {}
+        BaseNode.__init__(self, network, address, position)
+        # lookups started by this node: lookup id -> simpy event
+        self.waiting = {}
 
-    # --- to be provided by each overlay ----------------------------------
-    def key_id(self, key: str) -> int:
+    # these are written in ChordNode / PastryNode
+    def key_id(self, key):
         raise NotImplementedError
 
-    def next_hop(self, p: dict) -> tuple[NodeRef, dict] | None:
+    def next_hop(self, p):
         raise NotImplementedError
 
-    def forget(self, addr: int) -> None:
+    def forget(self, addr):
         raise NotImplementedError
 
-    def on_visit(self, p: dict) -> dict:
+    def on_visit(self, p):
         return p
 
-    def deliver(self, p: dict) -> Any:
+    def deliver(self, p):
         return None
 
-    # --- the machinery -----------------------------------------------------
     def handle_route(self, msg):
-        """A routing step arrives: acknowledge at once, keep routing in the
-        background (the ack only means "I've got it")."""
-        self.spawn(self._route(msg.payload))
+        # reply "ack" at once, the routing continues in another process
+        self.spawn(self.route_step(msg.payload))
         return "ack"
 
-    def _route(self, p: dict) -> Generator:
-        """This node's part of a route. `p` holds: key, origin, lid (route id),
-        hops, path (addresses visited), tag, purpose, data, plus any
-        overlay-specific fields added through next_hop()'s `extra`."""
+    def route_step(self, p):
+        """What one node does with a routing message.
+        p has: key, origin, lid (lookup id), hops, path, tag, purpose, data."""
         p = self.on_visit(p)
-        for _attempt in range(self.MAX_HOP_ATTEMPTS):
+        for attempt in range(self.MAX_HOP_ATTEMPTS):
             if not self.alive:
                 return
             step = self.next_hop(p)
-            if step is None:                       # I am the destination
-                self._finish_route(p, success=True)
+            if step is None:
+                # we are the owner of the key
+                self.finish_route(p, True)
                 return
             if p["hops"] >= self.MAX_HOPS:
                 break
-            nxt, extra = step
-            forward = {**p, **extra, "hops": p["hops"] + 1, "path": p["path"] + (nxt.addr,)}
+            next_node = step[0]
+            extra = step[1]
+            forward = dict(p)
+            forward.update(extra)
+            forward["hops"] = p["hops"] + 1
+            forward["path"] = p["path"] + (next_node.addr,)
             try:
-                yield from self.rpc(nxt.addr, "route", forward, tag=p["tag"],
+                yield from self.rpc(next_node.addr, "route", forward, tag=p["tag"],
                                     timeout=self.HOP_TIMEOUT)
-                return                             # handed over successfully
+                return
             except RpcTimeout:
-                self.forget(nxt.addr)              # looks dead: choose again
-        self._finish_route(p, success=False)
+                # next node looks dead, remove it and choose again
+                self.forget(next_node.addr)
+        self.finish_route(p, False)
 
-    def _finish_route(self, p: dict, success: bool) -> None:
-        result = {"lid": p["lid"], "success": success, "hops": p["hops"],
-                  "path": p["path"], "owner": self.ref if success else None,
-                  "result": self.deliver(p) if success else None}
+    def finish_route(self, p, success):
+        result = {"lid": p["lid"], "success": success, "hops": p["hops"], "path": p["path"]}
+        if success:
+            result["owner"] = self.ref
+            result["result"] = self.deliver(p)
+        else:
+            result["owner"] = None
+            result["result"] = None
         if p["origin"] == self.address:
-            self._complete(result)                 # I asked myself: no message
+            self.complete(result)     # we started it ourselves, no message needed
         else:
             self.send(p["origin"], "route_done", result, tag=p["tag"])
 
-    def handle_route_done(self, msg) -> None:
-        self._complete(msg.payload)
+    def handle_route_done(self, msg):
+        self.complete(msg.payload)
 
-    def _complete(self, result: dict) -> None:
-        event = self._waiting.get(result["lid"])
+    def complete(self, result):
+        event = self.waiting.get(result["lid"])
         if event is not None and not event.triggered:
             event.succeed(result)
 
-    def route(self, key: int, *, tag: str, purpose: str = "lookup", data: Any = None,
-              via: int | None = None) -> Generator:
-        """Route to the node responsible for ID `key`. Start here, or at node
-        `via` (used when joining: we are not part of the overlay yet).
-        Returns the result dict, or None if no answer arrived in time."""
-        lid = self.network.next_message_id()
-        done = self._waiting[lid] = self.env.event()
+    def route(self, key, tag, purpose="lookup", data=None, via=None):
+        """Route to the node responsible for ID key. If via is given the
+        route starts at that node (used for joining, since we are not in the
+        overlay yet). Returns the result dict, or None on timeout."""
+        lid = self.network.new_message_id()
+        done = self.env.event()
+        self.waiting[lid] = done
         p = {"key": key, "origin": self.address, "lid": lid, "hops": 0,
              "path": (self.address,), "tag": tag, "purpose": purpose, "data": data}
         if via is None:
-            self.spawn(self._route(p))
+            self.spawn(self.route_step(p))
         else:
-            first = {**p, "hops": 1, "path": p["path"] + (via,)}
+            first = dict(p)
+            first["hops"] = 1
+            first["path"] = p["path"] + (via,)
             try:
                 yield from self.rpc(via, "route", first, tag=tag, timeout=self.HOP_TIMEOUT)
             except RpcTimeout:
-                self._waiting.pop(lid, None)
+                del self.waiting[lid]
                 return None
-        yield done | self.env.timeout(self.LOOKUP_TIMEOUT)
-        self._waiting.pop(lid, None)
+        timer = self.env.timeout(self.LOOKUP_TIMEOUT)
+        yield self.env.any_of([done, timer])
+        del self.waiting[lid]
         if not self.alive:
             raise NodeCrashed(self.address)
-        return done.value if done.triggered else None
+        if done.triggered:
+            return done.value
+        return None
 
-    def lookup(self, key: str) -> Generator:
-        """Shared interface: find the node responsible for `key`.
-        Records and returns a LookupRecord."""
+    def lookup(self, key):
+        """Find the node responsible for key. Saves a LookupRecord in the
+        metrics and returns it."""
         start = self.env.now
         res = yield from self.route(self.key_id(key), tag="lookup")
         ok = res is not None and res["success"]
-        record = LookupRecord(
-            overlay=self.OVERLAY_NAME, origin=self.address, key=key,
-            start_time=start, end_time=self.env.now,
-            hops=res["hops"] if res else 0,
-            owner=res["owner"].addr if ok else None, success=ok,
-            path=res["path"] if res else ())
+        hops = 0
+        path = ()
+        owner = None
+        if res is not None:
+            hops = res["hops"]
+            path = res["path"]
+        if ok:
+            owner = res["owner"].addr
+        record = LookupRecord(self.OVERLAY_NAME, self.address, key, start, self.env.now,
+                              hops, owner, ok, path=path)
         self.metrics.record_lookup(record)
         return record

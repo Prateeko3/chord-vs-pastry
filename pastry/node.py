@@ -1,44 +1,31 @@
-"""A Pastry node, written from Rowstron & Druschel (Middleware 2001).
+"""Pastry node, implemented from the Pastry paper (Rowstron and Druschel,
+Middleware 2001).
 
-THE IDEA IN FOUR LINES
-----------------------
-- IDs are 128-bit numbers written as 32 digits in base 2^b (b = 4: hex).
-- Key k belongs to the live node whose ID is *numerically closest* to k
-  (on a circular ID space, like Chord's ring).
-- Each hop forwards to a node sharing at least one more leading digit with
-  the key, so a route takes about log_16(N) hops.
-- Among all nodes that could fill a routing-table slot, a node keeps the one
-  that is physically closest (lowest latency). So short hops come first, and
-  the expensive long-distance hops are few.
+Main idea:
+- IDs are 128 bit numbers, seen as 32 digits in base 2^b (b = 4, so hex)
+- a key is stored at the live node whose ID is numerically closest to it
+- each hop goes to a node that shares at least one more starting digit with
+  the key, so a route takes about log16(N) hops
+- for each routing table entry we keep the node with the lowest latency, so
+  most hops are short
 
-STATE (paper section 2.1)
--------------------------
-  routing table R  32 rows x 16 columns. Row l holds nodes that share the
-                   first l digits with me and whose digit l is the column
-                   number. (My own digit's column stays empty.)
-  leaf set L       the |L|/2 numerically closest smaller IDs (leaf_left) and
-                   |L|/2 closest larger IDs (leaf_right). Used for the last
-                   hop(s) and for correctness.
-  neighborhood M   the |M| physically closest nodes I know. Not used for
-                   normal routing; used to keep locality.
+State of a node (section 2.1 of the paper):
+  routing table - 32 rows x 16 columns. Row l has nodes that share the first
+                  l digits with us and have digit l = column number.
+  leaf set      - the 8 closest smaller IDs (leaf_left) and 8 closest larger
+                  IDs (leaf_right). Used for the last hop.
+  neighborhood  - the 32 nodes with lowest latency that we know about.
 
-ROUTING (paper Table 1) -> next_hop()
--------------------------------------
-  if key within leaf-set range:  forward to the leaf (or me) numerically
-                                 closest to the key
-  elif R[l][key digit l] exists: forward there (l = shared prefix length)
-  else ("rare case"):            forward to any known node T with
-                                 shl(T, key) >= l and |T - key| < |me - key|
-The forwarding mechanics (acks, timeouts, route_done) come from
-sim/overlay.py, the same code Chord uses.
+Routing (Table 1 in the paper) is in next_hop():
+  1. if the key is in the range of the leaf set -> go to the closest leaf
+  2. else use the routing table entry for the next digit
+  3. else (the "rare case") go to any known node that has at least the same
+     prefix length with the key and is numerically closer to it
 
-Every simplification relative to the paper is listed in
-docs/LEARNING_GUIDE.md, Phase 3, section 3.8.
+Sending/acks/timeouts are in sim/overlay.py (same code as Chord).
+The things we changed or simplified compared to the paper are listed in the
+learning guide (Phase 3, section 3.8).
 """
-
-from __future__ import annotations
-
-from typing import Any, Generator, Iterable
 
 from sim.ids import hash_to_id
 from sim.node import RpcTimeout
@@ -47,372 +34,433 @@ from sim.overlay import NodeRef, OverlayNode
 ID_BITS = 128
 
 
+def unique_nodes(refs):
+    """Remove duplicate nodes (same address), keep the first one, keep order."""
+    result = []
+    seen = set()
+    for r in refs:
+        if r.addr not in seen:
+            seen.add(r.addr)
+            result.append(r)
+    return result
+
+
 class PastryNode(OverlayNode):
     OVERLAY_NAME = "pastry"
-    MAX_REPAIR_TRIES = 4      # nodes asked when repairing one routing-table slot
-    FAILED_MEMORY = 30_000.0  # ms to refuse re-learning a node I saw fail
+    MAX_REPAIR_TRIES = 4       # how many nodes we ask to fix one table entry
+    FAILED_MEMORY = 30000.0    # ms we remember that a node was dead
 
-    def __init__(self, network, address, position, *, b: int = 4, leaf_size: int = 16,
-                 neighborhood_size: int = 32, node_id: int | None = None,
-                 maintenance_period: float = 1000.0, join_refine: bool = True):
-        super().__init__(network, address, position)
-        if ID_BITS % b:
+    def __init__(self, network, address, position, b=4, leaf_size=16,
+                 neighborhood_size=32, node_id=None, maintenance_period=1000.0,
+                 join_refine=True):
+        OverlayNode.__init__(self, network, address, position)
+        if ID_BITS % b != 0:
             raise ValueError("b must divide 128")
-        if leaf_size < 2 or leaf_size % 2:
+        if leaf_size < 2 or leaf_size % 2 != 0:
             raise ValueError("leaf_size must be an even number >= 2")
         self.b = b
-        self.base = 1 << b                 # digits per position: 16 for b = 4
-        self.digits = ID_BITS // b         # digits per ID: 32 for b = 4
-        self.space = 1 << ID_BITS          # size of the circular ID space
+        self.base = 2 ** b               # 16 possible digits when b = 4
+        self.digits = ID_BITS // b       # 32 digits when b = 4
+        self.space = 2 ** ID_BITS        # size of the ID space (it is a circle)
         self.half_leaf = leaf_size // 2
         self.m_size = neighborhood_size
         self.period = maintenance_period
         self.join_refine = join_refine
         if node_id is None:
-            node_id = hash_to_id(f"pastry-node:{network.seed}:{address}", ID_BITS)
+            node_id = hash_to_id("pastry-node:" + str(network.seed) + ":" + str(address), ID_BITS)
         self.id = node_id
         self.ref = NodeRef(node_id, address)
-        self.table: list[list[NodeRef | None]] = [[None] * self.base for _ in range(self.digits)]
-        self.leaf_left: list[NodeRef] = []     # smaller IDs, nearest first
-        self.leaf_right: list[NodeRef] = []    # larger IDs, nearest first
-        self.neighborhood: list[NodeRef] = []  # physically nearest first
+        self.table = []
+        for i in range(self.digits):
+            self.table.append([None] * self.base)
+        self.leaf_left = []       # smaller IDs, closest first
+        self.leaf_right = []      # bigger IDs, closest first
+        self.neighborhood = []    # lowest latency first
         self.joined = False
-        self._maintenance_started = False
-        self._probe_leaf = 0                   # round-robin positions for probing
-        self._probe_neigh = 0
-        self._repairs_running: set = set()     # avoid duplicate repair jobs
-        # Nodes I detected as failed (address -> time). Other nodes may still
-        # gossip them to me for a while; without this memory a dead node
-        # keeps being re-added to my leaf set and never goes away.
-        self._failed: dict[int, float] = {}
-        self._verifying: set[int] = set()      # gossip candidates being pinged
+        self.maintenance_started = False
+        self.leaf_probe_index = 0
+        self.neigh_probe_index = 0
+        self.repairs_running = set()
+        # nodes we found dead: address -> time. Other nodes can still tell us
+        # about them for a while, so we remember them and don't add them back.
+        self.failed_nodes = {}
+        self.pinging = set()      # nodes we are pinging before adding to leaf set
 
-    def __repr__(self) -> str:
-        return (f"<PastryNode addr={self.address} id={self.id:032x}"
-                f" {'alive' if self.alive else 'dead'}>")
+    def __repr__(self):
+        if self.alive:
+            state = "alive"
+        else:
+            state = "dead"
+        return "<PastryNode addr=%d id=%032x %s>" % (self.address, self.id, state)
 
-    # ------------------------------------------------------------------
-    # ID arithmetic
-    # ------------------------------------------------------------------
-    def key_id(self, key: str) -> int:
+    # ----- ID functions -----
+
+    def key_id(self, key):
         return hash_to_id(key, ID_BITS)
 
-    def digit(self, ident: int, row: int) -> int:
-        """Digit number `row` of an ID (row 0 = most significant digit)."""
+    def digit(self, ident, row):
+        """Digit number row of an ID (row 0 is the first digit)."""
         return (ident >> (self.b * (self.digits - 1 - row))) & (self.base - 1)
 
-    def shl(self, a: int, c: int) -> int:
-        """Length of the shared prefix of a and c, in digits (paper: shl)."""
+    def shl(self, a, c):
+        """Length of the shared prefix of a and c in digits (shl in the paper)."""
         x = a ^ c
-        return self.digits if x == 0 else (ID_BITS - x.bit_length()) // self.b
+        if x == 0:
+            return self.digits
+        return (ID_BITS - x.bit_length()) // self.b
 
-    def dist(self, a: int, c: int) -> int:
-        """Numerical distance on the circular ID space."""
+    def dist(self, a, c):
+        """Distance between two IDs on the circle."""
         d = abs(a - c)
         return min(d, self.space - d)
 
-    def _cw(self, a: int, c: int) -> int:
-        """Clockwise distance from a to c (how far c is 'above' a)."""
+    def cw_dist(self, a, c):
+        """Clockwise distance from a to c."""
         return (c - a) % self.space
 
-    def _closeness(self, ref: NodeRef, key: int) -> tuple[int, int]:
-        """Sort key for "numerically closest to key". Ties (two nodes exactly
-        equidistant) are broken by smaller ID, the same everywhere."""
+    def closeness(self, ref, key):
+        # used to find the numerically closest node. If two nodes are at the
+        # same distance the smaller ID wins (same rule everywhere)
         return (self.dist(ref.id, key), ref.id)
 
-    def proximity(self, ref: NodeRef) -> float:
-        """The proximity metric: network latency to that node. (Simplification:
-        read from the simulator instead of measured by pinging.)"""
+    def proximity(self, ref):
+        """Latency to another node. (Simplification: we take it from the
+        simulator instead of measuring it with pings.)"""
         return self.network.latency(self.address, ref.addr)
 
-    # ------------------------------------------------------------------
-    # Views of my state
-    # ------------------------------------------------------------------
-    def leaves(self) -> list[NodeRef]:
-        """All leaf-set members, without duplicates (in a small network the
-        same node can be on both sides)."""
-        return list({r.addr: r for r in (*self.leaf_left, *self.leaf_right)}.values())
+    # ----- reading our state -----
 
-    def table_entries(self) -> list[NodeRef]:
-        return [e for row in self.table for e in row if e is not None]
+    def leaves(self):
+        """All leaf set nodes. In a small network a node can be on both
+        sides, so we remove duplicates."""
+        return unique_nodes(self.leaf_left + self.leaf_right)
 
-    def known_nodes(self) -> list[NodeRef]:
-        """L u R u M, the set the paper's rare case searches."""
-        found = {r.addr: r for r in (*self.leaves(), *self.table_entries(), *self.neighborhood)}
-        return list(found.values())
+    def table_entries(self):
+        entries = []
+        for row in self.table:
+            for e in row:
+                if e is not None:
+                    entries.append(e)
+        return entries
 
-    def _leaf_set_wraps(self) -> bool:
-        """True if my leaf set covers the whole ring: I know every node
-        (no leaves at all, or the two sides overlap)."""
-        if not self.leaf_left or not self.leaf_right:
+    def known_nodes(self):
+        """Leaf set + routing table + neighborhood (what the rare case searches)."""
+        return unique_nodes(self.leaves() + self.table_entries() + self.neighborhood)
+
+    def leaf_set_covers_all(self):
+        """True if we know all the nodes (no leaves, or the two sides overlap)."""
+        if len(self.leaf_left) == 0 or len(self.leaf_right) == 0:
             return True
-        return bool({r.addr for r in self.leaf_left} & {r.addr for r in self.leaf_right})
+        left_addrs = set(r.addr for r in self.leaf_left)
+        for r in self.leaf_right:
+            if r.addr in left_addrs:
+                return True
+        return False
 
-    def _in_leaf_range(self, key: int) -> bool:
-        """Is key between my farthest left leaf and my farthest right leaf?"""
-        if self._leaf_set_wraps():
+    def in_leaf_range(self, key):
+        """Is key between our farthest left leaf and farthest right leaf?"""
+        if self.leaf_set_covers_all():
             return True
-        return (self._cw(self.id, key) <= self._cw(self.id, self.leaf_right[-1].id)
-                or self._cw(key, self.id) <= self._cw(self.leaf_left[-1].id, self.id))
+        if self.cw_dist(self.id, key) <= self.cw_dist(self.id, self.leaf_right[-1].id):
+            return True
+        return self.cw_dist(key, self.id) <= self.cw_dist(self.leaf_left[-1].id, self.id)
 
-    # ------------------------------------------------------------------
-    # Learning about nodes
-    # ------------------------------------------------------------------
-    def consider(self, refs: Iterable[NodeRef | None], *, leaf: bool = True) -> None:
-        """Offer some nodes to all three parts of my state. Each part keeps
-        a node only if it is better than what is there:
-          leaf set     numerically closer   (skipped if leaf=False)
-          table slot   physically closer (proximity neighbour selection)
-          neighborhood physically closer
-        Use leaf=False for second-hand news; the leaf set only takes
-        second-hand nodes through offer_gossip(), which pings them first.
-        """
-        fresh = [r for r in {r.addr: r for r in refs if r is not None}.values()
-                 if r.addr != self.address and not self._recently_failed(r.addr)]
-        if not fresh:
+    # ----- adding nodes to our state -----
+
+    def consider(self, refs, leaf=True):
+        """Try to add some nodes to our state. Each part keeps a node only if
+        it is better than what is already there:
+            leaf set     - numerically closer (skipped when leaf=False)
+            table entry  - lower latency
+            neighborhood - lower latency
+        leaf=False is used for nodes we only heard about from others, those go
+        into the leaf set only through check_and_add_leaves()."""
+        all_refs = []
+        for r in refs:
+            if r is not None:
+                all_refs.append(r)
+        fresh = []
+        for r in unique_nodes(all_refs):
+            if r.addr != self.address and not self.failed_recently(r.addr):
+                fresh.append(r)
+        if len(fresh) == 0:
             return
-        # Leaf set: keep the half_leaf nearest on each side.
+        # leaf set: keep the half_leaf closest on each side
         if leaf:
-            pool = {r.addr: r for r in (*self.leaf_left, *self.leaf_right, *fresh)}.values()
-            self.leaf_right = sorted(pool, key=lambda r: self._cw(self.id, r.id))[:self.half_leaf]
-            self.leaf_left = sorted(pool, key=lambda r: self._cw(r.id, self.id))[:self.half_leaf]
-        # Routing table: slot (shared prefix length, next digit).
+            pool = unique_nodes(self.leaf_left + self.leaf_right + fresh)
+            self.leaf_right = sorted(pool, key=lambda r: self.cw_dist(self.id, r.id))[:self.half_leaf]
+            self.leaf_left = sorted(pool, key=lambda r: self.cw_dist(r.id, self.id))[:self.half_leaf]
+        # routing table: row = shared prefix length, column = next digit
         for r in fresh:
             row = self.shl(self.id, r.id)
             if row >= self.digits:
-                continue                       # same ID as me (cannot happen)
+                continue
             col = self.digit(r.id, row)
             cur = self.table[row][col]
-            if cur is None or (cur.addr != r.addr and self.proximity(r) < self.proximity(cur)):
+            if cur is None:
                 self.table[row][col] = r
-        # Neighborhood set: the m_size physically closest.
-        pool = {r.addr: r for r in (*self.neighborhood, *fresh)}.values()
+            elif cur.addr != r.addr and self.proximity(r) < self.proximity(cur):
+                self.table[row][col] = r
+        # neighborhood: the m_size nodes with lowest latency
+        pool = unique_nodes(self.neighborhood + fresh)
         self.neighborhood = sorted(pool, key=self.proximity)[:self.m_size]
 
-    def offer_gossip(self, refs: Iterable[NodeRef | None]) -> None:
-        """Second-hand news about nodes (from another node's leaf set).
+    def check_and_add_leaves(self, refs):
+        """For nodes we heard about from another node's leaf set.
 
-        It may be stale: the other node might not have noticed yet that some
-        of these nodes have died. So a node that would *enter* my leaf set is
-        pinged first and only added if it answers. Without this, dead nodes
-        keep being passed around and leaf sets never become clean.
+        This info can be old (the other node may not know yet that some of
+        them died). So if a node would go into our leaf set we ping it first
+        and only add it if it answers. Without this, dead nodes kept coming
+        back into the leaf sets after crashes.
         """
-        fresh = {r.addr: r for r in refs if r is not None and r.addr != self.address
-                 and not self._recently_failed(r.addr)}
-        current = {r.addr for r in self.leaves()}
-        pool = {**{r.addr: r for r in self.leaves()}, **fresh}.values()
-        right = sorted(pool, key=lambda r: self._cw(self.id, r.id))[:self.half_leaf]
-        left = sorted(pool, key=lambda r: self._cw(r.id, self.id))[:self.half_leaf]
-        for r in {x.addr: x for x in (*left, *right)}.values():
-            if r.addr not in current and r.addr not in self._verifying:
-                self._verifying.add(r.addr)
-                self.spawn(self._verify_then_add(r))
+        fresh = []
+        for r in refs:
+            if r is not None and r.addr != self.address and not self.failed_recently(r.addr):
+                fresh.append(r)
+        current = set(r.addr for r in self.leaves())
+        pool = unique_nodes(self.leaves() + fresh)
+        right = sorted(pool, key=lambda r: self.cw_dist(self.id, r.id))[:self.half_leaf]
+        left = sorted(pool, key=lambda r: self.cw_dist(r.id, self.id))[:self.half_leaf]
+        for r in unique_nodes(left + right):
+            if r.addr not in current and r.addr not in self.pinging:
+                self.pinging.add(r.addr)
+                self.spawn(self.ping_then_add(r))
 
-    def _verify_then_add(self, ref: NodeRef) -> Generator:
+    def ping_then_add(self, ref):
         try:
             yield from self.rpc(ref.addr, "ping", tag="maintenance", timeout=self.HOP_TIMEOUT)
             self.consider([ref])
         except RpcTimeout:
-            self._failed[ref.addr] = self.env.now    # dead: don't ask again soon
+            self.failed_nodes[ref.addr] = self.env.now
         finally:
-            self._verifying.discard(ref.addr)
+            self.pinging.discard(ref.addr)
 
-    # ------------------------------------------------------------------
-    # Routing: the paper's Table 1
-    # ------------------------------------------------------------------
-    def next_hop(self, p: dict):
+    # ----- routing (Table 1 of the paper) -----
+
+    def next_hop(self, p):
         key = p["key"]
         if key == self.id:
             return None
-        # (1) Key within leaf-set range: go to the numerically closest leaf.
-        if self._in_leaf_range(key):
-            best = min([self.ref, *self.leaves()], key=lambda r: self._closeness(r, key))
-            return None if best.addr == self.address else (best, {})
-        # (2) Routing table: a node sharing one more digit with the key.
+        # 1. key is in leaf set range: go to the numerically closest one
+        if self.in_leaf_range(key):
+            best = self.ref
+            for r in self.leaves():
+                if self.closeness(r, key) < self.closeness(best, key):
+                    best = r
+            if best.addr == self.address:
+                return None
+            return best, {}
+        # 2. routing table: node with one more matching digit
         row = self.shl(key, self.id)
         entry = self.table[row][self.digit(key, row)]
         if entry is not None:
             return entry, {}
-        # (3) Rare case: any node at least as good in prefix, and numerically
-        #     closer. We pick the numerically closest such node.
+        # 3. rare case: a node with at least the same prefix length that is
+        #    numerically closer to the key. We take the closest one.
         my_dist = self.dist(self.id, key)
         best = None
         for r in self.known_nodes():
             if self.shl(r.id, key) >= row and self.dist(r.id, key) < my_dist:
-                if best is None or self._closeness(r, key) < self._closeness(best, key):
+                if best is None or self.closeness(r, key) < self.closeness(best, key):
                     best = r
-        return (best, {}) if best is not None else None
+        if best is None:
+            return None
+        return best, {}
 
-    # ------------------------------------------------------------------
-    # Joining (paper section 2.4, "Node arrival")
-    # ------------------------------------------------------------------
-    def join(self, bootstrap: int | None) -> Generator:
-        """Join through `bootstrap`, which should be physically close to me.
+    # ----- joining (section 2.4 of the paper) -----
 
-        1. Route a "join" message with key = my ID, starting at the bootstrap
-           A. Every node on the path adds the routing-table rows I can use
-           (rows 0..shl(it, me)) and its neighborhood set (on_visit). The
-           final node Z, numerically closest to me, adds its leaf set
-           (deliver).
-        2. Build my state from everything collected (consider()).
-        3. (Optional, join_refine) Ask every node in my routing table and
-           neighborhood set for its state, and keep any physically closer
-           nodes (the paper's locality improvement step).
-        4. Announce myself to every node in my state.
+    def join(self, bootstrap):
+        """Join using a bootstrap node that should be close to us.
+
+        1. send a join message with key = our ID starting at the bootstrap
+           node A. Each node on the way adds the table rows we can use and its
+           neighborhood set (on_visit). The last node Z (numerically closest
+           to us) adds its leaf set (deliver).
+        2. build our state from all these nodes
+        3. if join_refine: ask every node in our table and neighborhood for
+           its state and keep nodes that are closer (locality step from the paper)
+        4. tell everyone in our state that we joined
         """
         tag = "join"
         if bootstrap is None:
             self.joined = True
             return True
-        res = yield from self.route(self.id, tag=tag, purpose="join",
-                                    data={"joiner": self.ref, "cands": ()}, via=bootstrap)
+        data = {"joiner": self.ref, "cands": ()}
+        res = yield from self.route(self.id, tag, purpose="join", data=data, via=bootstrap)
         if res is None or not res["success"]:
             return False
         self.consider(res["result"]["cands"])
         if self.join_refine:
-            targets = [r.addr for r in {r.addr: r for r in
-                       (*self.table_entries(), *self.neighborhood)}.values()]
-            for state in (yield from self._ask_all(targets, "get_state", None, tag)):
+            targets = []
+            for r in unique_nodes(self.table_entries() + self.neighborhood):
+                targets.append(r.addr)
+            answers = yield from self.ask_many(targets, "get_state", None, tag)
+            for state in answers:
                 if state is not None:
-                    self.consider([state[0]])           # the node that answered
-                    self.consider(state, leaf=False)    # what it knows: second-hand
-                    self.offer_gossip(state)
+                    self.consider([state[0]])            # the node that answered
+                    self.consider(state, leaf=False)     # nodes it told us about
+                    self.check_and_add_leaves(state)
         announcement = {"node": self.ref, "leaves": tuple(self.leaves())}
         for r in self.known_nodes():
             self.send(r.addr, "announce", announcement, tag=tag)
         self.joined = True
         return True
 
-    def on_visit(self, p: dict) -> dict:
-        """Each node on a join route contributes state the joiner can use."""
+    def on_visit(self, p):
+        """Every node on the join route gives the new node some of its state."""
         if p["purpose"] != "join":
             return p
-        joiner: NodeRef = p["data"]["joiner"]
+        joiner = p["data"]["joiner"]
         usable_rows = min(self.shl(self.id, joiner.id), self.digits - 1)
-        gift = [self.ref, *self.neighborhood]
+        gift = [self.ref] + self.neighborhood
         for row in range(usable_rows + 1):
-            gift.extend(e for e in self.table[row] if e is not None)
-        data = {**p["data"], "cands": p["data"]["cands"] + tuple(gift)}
-        return {**p, "data": data}
+            for e in self.table[row]:
+                if e is not None:
+                    gift.append(e)
+        new_data = dict(p["data"])
+        new_data["cands"] = p["data"]["cands"] + tuple(gift)
+        new_p = dict(p)
+        new_p["data"] = new_data
+        return new_p
 
-    def deliver(self, p: dict) -> Any:
+    def deliver(self, p):
         if p["purpose"] == "join":
-            # I am Z, numerically closest to the joiner: add my leaf set.
-            return {"cands": p["data"]["cands"] + (self.ref, *self.leaves())}
+            # we are Z (closest to the new node), so add our leaf set too
+            return {"cands": p["data"]["cands"] + tuple([self.ref] + self.leaves())}
         return None
 
-    def handle_announce(self, msg) -> None:
-        self.consider([msg.payload["node"]])       # the sender is clearly alive
-        self.offer_gossip(msg.payload["leaves"])
+    def handle_announce(self, msg):
+        self.consider([msg.payload["node"]])          # the sender is alive
+        self.check_and_add_leaves(msg.payload["leaves"])
 
-    def handle_get_state(self, msg) -> tuple:
-        return (self.ref, *self.known_nodes())
+    def handle_get_state(self, msg):
+        return tuple([self.ref] + self.known_nodes())
 
-    def handle_get_leafset(self, msg) -> tuple:
-        return (self.ref, *self.leaves())
+    def handle_get_leafset(self, msg):
+        return tuple([self.ref] + self.leaves())
 
-    def handle_get_neighborhood(self, msg) -> tuple:
-        return (self.ref, *self.neighborhood)
+    def handle_get_neighborhood(self, msg):
+        return tuple([self.ref] + self.neighborhood)
 
     def handle_get_table_entry(self, msg):
         row, col = msg.payload
         return self.table[row][col]
 
-    def handle_ping(self, msg) -> str:
+    def handle_ping(self, msg):
         return "pong"
 
-    def _ask_all(self, addrs: list[int], kind: str, payload: Any, tag: str) -> Generator:
-        """Send the same RPC to many nodes in parallel; return their answers
-        (None for any that timed out; those nodes are forgotten)."""
-        def ask(addr):
-            try:
-                return (yield from self.rpc(addr, kind, payload, tag=tag,
-                                            timeout=self.HOP_TIMEOUT))
-            except RpcTimeout:
-                self.forget(addr)
-                return None
-        procs = [self.spawn(ask(a)) for a in addrs]
-        if procs:
+    def ask_many(self, addrs, kind, payload, tag):
+        """Send the same rpc to many nodes at the same time and wait for all.
+        Returns the answers (None for nodes that didn't answer)."""
+        procs = []
+        for a in addrs:
+            procs.append(self.spawn(self.ask_one(a, kind, payload, tag)))
+        if len(procs) > 0:
             yield self.env.all_of(procs)
-        return [p.value for p in procs]
+        answers = []
+        for p in procs:
+            answers.append(p.value)
+        return answers
 
-    # ------------------------------------------------------------------
-    # Failure handling (paper section 2.4, "Node departure")
-    # ------------------------------------------------------------------
-    def _recently_failed(self, addr: int) -> bool:
-        when = self._failed.get(addr)
+    def ask_one(self, addr, kind, payload, tag):
+        try:
+            answer = yield from self.rpc(addr, kind, payload, tag=tag, timeout=self.HOP_TIMEOUT)
+            return answer
+        except RpcTimeout:
+            self.forget(addr)
+            return None
+
+    # ----- failures (section 2.4 of the paper) -----
+
+    def failed_recently(self, addr):
+        when = self.failed_nodes.get(addr)
         if when is None:
             return False
         if self.env.now - when > self.FAILED_MEMORY:
-            del self._failed[addr]
+            del self.failed_nodes[addr]
             return False
         return True
 
-    def forget(self, addr: int, *, repair: bool = True) -> None:
-        """Remove a node believed dead from all my state, and start the
-        paper's repair procedure for whatever it occupied."""
-        self._failed[addr] = self.env.now
-        side = None
-        if any(r.addr == addr for r in self.leaf_left):
-            side = "left"
-        if any(r.addr == addr for r in self.leaf_right):
-            side = "right" if side is None else "both"
+    def forget(self, addr, repair=True):
+        """Remove a dead node from our state and start the repair from the
+        paper for the places where it was."""
+        self.failed_nodes[addr] = self.env.now
+        in_left = False
+        in_right = False
+        for r in self.leaf_left:
+            if r.addr == addr:
+                in_left = True
+        for r in self.leaf_right:
+            if r.addr == addr:
+                in_right = True
         self.leaf_left = [r for r in self.leaf_left if r.addr != addr]
         self.leaf_right = [r for r in self.leaf_right if r.addr != addr]
-        in_neigh = any(r.addr == addr for r in self.neighborhood)
+        in_neigh = False
+        for r in self.neighborhood:
+            if r.addr == addr:
+                in_neigh = True
         self.neighborhood = [r for r in self.neighborhood if r.addr != addr]
         slots = []
-        for row_i, row in enumerate(self.table):
-            for col, e in enumerate(row):
-                if e is not None and e.addr == addr:
+        for row_i in range(len(self.table)):
+            row = self.table[row_i]
+            for col in range(len(row)):
+                if row[col] is not None and row[col].addr == addr:
                     row[col] = None
                     slots.append((row_i, col))
         if not repair or not self.alive:
             return
-        if side in ("left", "both"):
-            self._start_repair(("leaf", "left"), self._repair_leaf("left", addr))
-        if side in ("right", "both"):
-            self._start_repair(("leaf", "right"), self._repair_leaf("right", addr))
+        if in_left:
+            self.start_repair(("leaf", "left"), self.repair_leaf("left", addr))
+        if in_right:
+            self.start_repair(("leaf", "right"), self.repair_leaf("right", addr))
         for slot in slots:
-            self._start_repair(("table", slot), self._repair_table_slot(*slot, addr))
+            self.start_repair(("table", slot), self.repair_table_slot(slot[0], slot[1], addr))
         if in_neigh:
-            self._start_repair(("neigh",), self._repair_neighborhood(addr))
+            self.start_repair(("neigh",), self.repair_neighborhood(addr))
 
-    def _start_repair(self, job: tuple, gen: Generator) -> None:
-        if job in self._repairs_running:
-            gen.close()
+    def start_repair(self, job, gen):
+        # only one repair of the same thing at a time
+        if job in self.repairs_running:
             return
-        self._repairs_running.add(job)
+        self.repairs_running.add(job)
+        self.spawn(self.run_repair(job, gen))
 
-        def run():
-            try:
-                yield from gen
-            finally:
-                self._repairs_running.discard(job)
-        self.spawn(run())
+    def run_repair(self, job, gen):
+        try:
+            yield from gen
+        finally:
+            self.repairs_running.discard(job)
 
-    def _repair_leaf(self, side: str, dead: int) -> Generator:
-        """Paper: contact the live leaf with the largest index on the side of
-        the failed node and ask for its leaf set."""
-        members = self.leaf_left if side == "left" else self.leaf_right
-        target = members[-1] if members else (self.leaves() or [None])[-1]
-        if target is None:
+    def repair_leaf(self, side, dead):
+        """From the paper: ask the live leaf with the largest index on that
+        side for its leaf set."""
+        if side == "left":
+            members = self.leaf_left
+        else:
+            members = self.leaf_right
+        if len(members) > 0:
+            target = members[-1]
+        elif len(self.leaves()) > 0:
+            target = self.leaves()[-1]
+        else:
             return
         try:
             leafset = yield from self.rpc(target.addr, "get_leafset", tag="maintenance",
                                           timeout=self.HOP_TIMEOUT)
         except RpcTimeout:
-            self.forget(target.addr)           # that one is dead too: repeats
+            self.forget(target.addr)   # also dead, this starts another repair
             return
-        self.consider([leafset[0]])                # the node that just answered
-        self.offer_gossip(r for r in leafset if r.addr != dead)
+        self.consider([leafset[0]])    # the node that answered is alive
+        self.check_and_add_leaves([r for r in leafset if r.addr != dead])
 
-    def _repair_table_slot(self, row: int, col: int, dead: int) -> Generator:
-        """Paper: ask another node in the same row for its entry R[row][col];
-        if none helps, cast a wider net with the nodes in row + 1."""
+    def repair_table_slot(self, row, col, dead):
+        """From the paper: ask other nodes in the same row for their entry
+        [row][col]. If that doesn't work, ask nodes in the next row."""
         asked = 0
         for r in range(row, self.digits):
-            for c, entry in enumerate(self.table[r]):
+            row_list = self.table[r]
+            for c in range(len(row_list)):
+                entry = row_list[c]
                 if entry is None or (r == row and c == col):
                     continue
                 if asked >= self.MAX_REPAIR_TRIES or self.table[row][col] is not None:
@@ -424,13 +472,13 @@ class PastryNode(OverlayNode):
                 except RpcTimeout:
                     self.forget(entry.addr)
                     continue
-                if found is not None and found.addr not in (dead, self.address):
+                if found is not None and found.addr != dead and found.addr != self.address:
                     self.consider([found], leaf=False)
 
-    def _repair_neighborhood(self, dead: int) -> Generator:
-        """Paper: ask other neighborhood members for their neighborhood sets
-        and keep the closest nodes (we ask the nearest remaining member)."""
-        if not self.neighborhood:
+    def repair_neighborhood(self, dead):
+        """From the paper: ask another neighborhood member for its
+        neighborhood set (we ask the closest one)."""
+        if len(self.neighborhood) == 0:
             return
         target = self.neighborhood[0]
         try:
@@ -440,70 +488,71 @@ class PastryNode(OverlayNode):
             self.forget(target.addr)
             return
         self.consider([theirs[0]])
-        self.consider((r for r in theirs if r.addr != dead), leaf=False)
+        self.consider([r for r in theirs if r.addr != dead], leaf=False)
 
-    # ------------------------------------------------------------------
-    # Periodic maintenance
-    # ------------------------------------------------------------------
-    def start_maintenance(self) -> None:
-        if self._maintenance_started:
+    # ----- periodic maintenance -----
+
+    def start_maintenance(self):
+        if self.maintenance_started:
             return
-        self._maintenance_started = True
+        self.maintenance_started = True
         self.run_periodically(self.period, self.maintain)
 
-    def maintain(self) -> Generator:
-        """One keep-alive round (the paper says leaf-set neighbours exchange
-        keep-alives but doesn't fix a protocol; this is ours):
-          1. swap leaf sets with my immediate left and right neighbours
-             (detects their failure, and merges in nodes they know about)
-          2. ping one other leaf-set member (round-robin)
-          3. ping one neighborhood-set member (round-robin)
+    def maintain(self):
+        """Keep-alive round. The paper says leaf set neighbours send
+        keep-alives but doesn't give the exact protocol, so we do this:
+          1. get the leaf set of our left and right neighbour
+          2. ping one other leaf set node (going round the list)
+          3. ping one neighborhood node (going round the list)
         """
         tag = "maintenance"
-        neighbours = {r.addr: r for r in (self.leaf_left[:1] + self.leaf_right[:1])}
-        for r in neighbours.values():
+        neighbours = unique_nodes(self.leaf_left[:1] + self.leaf_right[:1])
+        for r in neighbours:
             try:
                 leafset = yield from self.rpc(r.addr, "get_leafset", tag=tag,
                                               timeout=self.HOP_TIMEOUT)
-                self.offer_gossip(leafset)
+                self.check_and_add_leaves(leafset)
             except RpcTimeout:
                 self.forget(r.addr)
-        for members, attr in ((self.leaves(), "_probe_leaf"), (self.neighborhood, "_probe_neigh")):
-            if not members:
-                continue
-            i = getattr(self, attr) % len(members)
-            setattr(self, attr, i + 1)
-            target = members[i]
+        # take both lists now (forget() below can change self.neighborhood)
+        leaf_members = self.leaves()
+        neigh_members = self.neighborhood
+        if len(leaf_members) > 0:
+            i = self.leaf_probe_index % len(leaf_members)
+            self.leaf_probe_index = i + 1
+            target = leaf_members[i]
+            try:
+                yield from self.rpc(target.addr, "ping", tag=tag, timeout=self.HOP_TIMEOUT)
+            except RpcTimeout:
+                self.forget(target.addr)
+        if len(neigh_members) > 0:
+            i = self.neigh_probe_index % len(neigh_members)
+            self.neigh_probe_index = i + 1
+            target = neigh_members[i]
             try:
                 yield from self.rpc(target.addr, "ping", tag=tag, timeout=self.HOP_TIMEOUT)
             except RpcTimeout:
                 self.forget(target.addr)
 
-    # ------------------------------------------------------------------
-    # Leaving (an addition: the paper treats every departure as a failure)
-    # ------------------------------------------------------------------
-    def leave(self) -> Generator:
-        """Tell my leaf set I'm going, and hand them my leaf set so they can
-        replace me at once. Routing-table entries elsewhere that point to me
-        are repaired lazily, as for a failure."""
+    # ----- leaving (the paper treats leaving like a failure, we added this) -----
+
+    def leave(self):
+        """Tell our leaf set that we leave and give them our leaf set so they
+        can replace us. Table entries pointing to us get fixed later."""
         if not self.alive:
             return
         notice = {"node": self.ref, "leaves": tuple(self.leaves())}
         for r in self.leaves():
             self.send(r.addr, "leaving", notice, tag="leave")
         self.alive = False
-        self._pending.clear()
+        self.pending = {}
         yield self.env.timeout(0)
 
-    def handle_leaving(self, msg) -> None:
-        gone: NodeRef = msg.payload["node"]
+    def handle_leaving(self, msg):
+        gone = msg.payload["node"]
         self.forget(gone.addr, repair=False)
-        self.offer_gossip(r for r in msg.payload["leaves"] if r.addr != gone.addr)
+        self.check_and_add_leaves([r for r in msg.payload["leaves"] if r.addr != gone.addr])
 
-    # ------------------------------------------------------------------
-    # Measurements
-    # ------------------------------------------------------------------
-    def routing_state_size(self) -> int:
-        """Distinct other nodes in my routing table, leaf set and
-        neighborhood set (everything I maintain)."""
+    def routing_state_size(self):
+        """Number of different nodes in the table, leaf set and neighborhood."""
         return len(self.known_nodes())

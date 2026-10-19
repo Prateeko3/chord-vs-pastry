@@ -1,24 +1,15 @@
-"""Phase 1 demo: what do the three network topologies "feel like"?
+"""Phase 1 demo: ping random pairs of nodes on the three topologies.
 
-For each topology we create N nodes, then pick random pairs and measure the
-round-trip time (RTT) of a real simulated RPC ("ping"). This exercises the
-whole Phase 1 stack: topology -> network -> node RPC -> metrics.
-
-What to look for:
-  uniform      RTTs spread smoothly; median about 2 x 52 ms.
-  clustered    two very different kinds of pair. Same-cluster pings are
-               tiny (p5 is small) and cross-cluster pings are large. That
-               gap is what Pastry's proximity-aware routing should exploit.
-  homogeneous  every RTT is identical, so there is nothing to exploit.
-Then the same pings with 10% message loss, showing how RPC timeouts
-surface lost requests and lost replies.
+For each topology we make N nodes, ping random pairs and print the round trip
+times (RTT). On the uniform map the median should be around 2 x 52 ms. On the
+clustered map p5 is very small (same cluster) and p95 is big (different
+clusters). On the homogeneous map every RTT is the same.
+At the end we run the pings again with 10% message loss to see the timeouts.
 
 Run:
     python -m experiments.phase1_network_demo
     python -m experiments.phase1_network_demo --nodes 500 --pings 5000 --seed 7
 """
-
-from __future__ import annotations
 
 import argparse
 
@@ -28,7 +19,7 @@ from sim.metrics import percentile, summarize
 from sim.network import Network
 from sim.node import BaseNode, RpcTimeout
 from sim.rng import make_rng
-from sim.topology import Clustered, Homogeneous, Topology, UniformSquare
+from sim.topology import Clustered, Homogeneous, UniformSquare
 
 
 class PingNode(BaseNode):
@@ -36,58 +27,55 @@ class PingNode(BaseNode):
         return "pong"
 
 
-def measure(topology: Topology, n_nodes: int, n_pings: int, seed: int,
-            loss_rate: float = 0.0) -> dict:
+def one_ping(env, a, b, rtts, counts):
+    start = env.now
+    try:
+        yield from a.rpc(b.address, "ping", timeout=500)
+        rtts.append(env.now - start)
+    except RpcTimeout:
+        counts["timeouts"] += 1
+
+
+def measure(topology, n_nodes, n_pings, seed, loss_rate=0.0):
     env = simpy.Environment()
     net = Network(env, seed=seed, topology=topology, loss_rate=loss_rate)
-    nodes = [net.create_node(PingNode) for _ in range(n_nodes)]
+    nodes = []
+    for i in range(n_nodes):
+        nodes.append(net.create_node(PingNode))
     pick = make_rng(seed, "demo-workload")
-    rtts: list[float] = []
-    timeouts = 0
-
-    def one_ping(a: PingNode, b: PingNode):
-        nonlocal timeouts
-        start = env.now
-        try:
-            yield from a.rpc(b.address, "ping", timeout=500)
-            rtts.append(env.now - start)
-        except RpcTimeout:
-            timeouts += 1
-
-    for _ in range(n_pings):
+    rtts = []
+    counts = {"timeouts": 0}
+    for i in range(n_pings):
         a, b = pick.sample(nodes, 2)   # two different nodes
-        env.process(one_ping(a, b))
+        env.process(one_ping(env, a, b, rtts, counts))
     env.run()
     rtt = summarize(rtts)
-    rtt["p5"] = percentile(rtts, 5)   # how fast the *closest* pairs are
-    return {"rtt": rtt, "timeouts": timeouts, "metrics": net.metrics}
+    rtt["p5"] = percentile(rtts, 5)
+    return {"rtt": rtt, "timeouts": counts["timeouts"], "metrics": net.metrics}
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--nodes", type=int, default=200)
-    p.add_argument("--pings", type=int, default=2000)
-    p.add_argument("--seed", type=int, default=42)
-    a = p.parse_args()
+def main():
+    parser = argparse.ArgumentParser(description="Phase 1 demo: ping times on the three topologies")
+    parser.add_argument("--nodes", type=int, default=200)
+    parser.add_argument("--pings", type=int, default=2000)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
 
     topologies = [UniformSquare(), Clustered(), Homogeneous()]
-    print(f"Ping RTTs between random node pairs (N={a.nodes}, {a.pings} pings, "
-          f"seed={a.seed}); all times in simulated ms\n")
-    print(f"{'topology':<12}{'mean':>8}{'p5':>8}{'p50':>8}{'p95':>8}{'max':>8}")
+    print("Ping RTTs between random node pairs (N=%d, %d pings, seed=%d); "
+          "all times in simulated ms\n" % (args.nodes, args.pings, args.seed))
+    print("%-12s%8s%8s%8s%8s%8s" % ("topology", "mean", "p5", "p50", "p95", "max"))
     for topo in topologies:
-        r = measure(topo, a.nodes, a.pings, a.seed)["rtt"]
-        print(f"{topo.name:<12}{r['mean']:8.1f}{percentile_row(r)}")
+        r = measure(topo, args.nodes, args.pings, args.seed)["rtt"]
+        print("%-12s%8.1f%8.1f%8.1f%8.1f%8.1f" % (topo.name, r["mean"], r["p5"], r["p50"],
+                                                   r["p95"], r["max"]))
 
     print("\nSame pings on the uniform topology with 10% message loss:")
-    r = measure(UniformSquare(), a.nodes, a.pings, a.seed, loss_rate=0.10)
+    r = measure(UniformSquare(), args.nodes, args.pings, args.seed, loss_rate=0.10)
     m = r["metrics"]
-    print(f"  messages sent {m.total_sent}, lost {m.lost}, "
-          f"RPC timeouts {r['timeouts']} of {a.pings} pings "
-          f"({100 * r['timeouts'] / a.pings:.1f}%; theory 1 - 0.9^2 = 19%)")
-
-
-def percentile_row(r: dict) -> str:
-    return "".join(f"{r[k]:8.1f}" for k in ("p5", "p50", "p95", "max"))
+    print("  messages sent %d, lost %d, RPC timeouts %d of %d pings "
+          "(%.1f%%; theory 1 - 0.9^2 = 19%%)" % (m.total_sent(), m.lost, r["timeouts"], args.pings,
+                                                100 * r["timeouts"] / args.pings))
 
 
 if __name__ == "__main__":

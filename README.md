@@ -1,81 +1,72 @@
-# Chord vs. Pastry: Comparative Performance Analysis of Structured P2P Overlay Routing
+# Chord vs Pastry
 
-A university Distributed Systems project. Two classic distributed hash table
-(DHT) overlays are implemented **from scratch**, following the original papers:
+Distributed Systems course project (Monsoon 2026, Option 1).
 
-- **Chord**: I. Stoica, R. Morris, D. Karger, M. F. Kaashoek, H. Balakrishnan.
-  *Chord: A Scalable Peer-to-peer Lookup Service for Internet Applications.*
-  SIGCOMM 2001 (extended version in IEEE/ACM ToN, 2003).
-- **Pastry**: A. Rowstron, P. Druschel. *Pastry: Scalable, decentralized
-  object location and routing for large-scale peer-to-peer systems.*
-  Middleware 2001.
+Comparative performance analysis of structured P2P overlay routing. We
+implemented two DHT algorithms from their original papers and compare them:
 
-Both overlays run inside a single-machine **discrete-event simulation**
-(`simpy`) with a 2-D latency model. A key-value store sits on top of each one,
-and the experiments compare hops, latency, state size, maintenance cost, load
-balance and robustness under churn.
+- **Chord**: Stoica, Morris, Karger, Kaashoek, Balakrishnan. "Chord: A Scalable
+  Peer-to-peer Lookup Service for Internet Applications", SIGCOMM 2001
+  (longer version in IEEE/ACM Transactions on Networking, 2003).
+- **Pastry**: Rowstron, Druschel. "Pastry: Scalable, decentralized object
+  location and routing for large-scale peer-to-peer systems", Middleware 2001.
 
-> **Hypothesis.** Pastry's proximity-aware routing gives lower lookup
-> *latency* on heterogeneous networks, while Chord has simpler maintenance.
+Everything runs on one machine as a simulation using `simpy`. Every node has
+a position on a 2D map and the message delay is the distance between the
+nodes, so we can see if Pastry's "pick nearby nodes" idea really helps.
 
-## Project layout
+What we want to check: Pastry should have lower lookup latency when the
+network has very different link delays, and Chord should be simpler to
+maintain.
+
+## Folders
 
 ```
-chord-vs-pastry/
-├── sim/            simulation core (Phase 0-1)
-│   ├── rng.py      seeded, named random streams (reproducibility)
-│   ├── ids.py      SHA-1 → identifier hashing, ring-interval helper
-│   ├── topology.py node placement + latency: uniform / clustered / homogeneous
-│   ├── network.py  Message + Network: delivery after latency, jitter, loss
-│   ├── node.py     BaseNode: send, rpc (with timeout), handlers, periodic tasks
-│   ├── metrics.py  shared metrics collector (messages, lookups, distributions)
-│   └── overlay.py  recursive routing shared by both overlays (route/ack/timeout/lookup)
-├── chord/          Chord overlay (Phase 2)
-│   ├── node.py     ChordNode: fingers, successor list, lookup, join, stabilize, leave
-│   └── ring.py     test/experiment helpers: unique IDs, static builder, oracle
-├── pastry/         Pastry overlay (Phase 3)
-│   ├── node.py     PastryNode: routing table, leaf set, neighbourhood set, join, repair
-│   └── ring.py     test/experiment helpers: static builder (optimal/random), oracle
-├── app/            key-value store on either overlay (Phase 4)
-├── experiments/    parameter sweeps → CSV + PNG     (Phase 5)
-│   └── results/    generated CSV tables and PNG plots (committed, so the team can study them)
-├── tests/          pytest correctness tests
-└── docs/
-    └── LEARNING_GUIDE.md   explanations, glossary, work log, viva questions
+sim/          simulator: network, nodes, metrics, topologies
+  rng.py        random generators from one seed
+  ids.py        SHA-1 hashing and the ring interval check
+  topology.py   node positions and latency (uniform / clustered / homogeneous)
+  network.py    sends messages with delay, jitter and loss
+  node.py       base node: send, rpc with timeout, periodic tasks
+  metrics.py    counts messages, hops, latency (same for both overlays)
+  overlay.py    routing code used by both Chord and Pastry
+chord/        Chord (node.py) + helper functions for tests (ring.py)
+pastry/       Pastry (node.py) + helper functions for tests (ring.py)
+app/          key-value store (phase 4, not done yet)
+experiments/  demo scripts and the graphs
+  results/      csv files and graphs
+tests/        pytest tests
+docs/         LEARNING_GUIDE.md (our notes for every phase)
 ```
 
 ## Setup
 
-Requires **Python 3.11 or newer**. On macOS with Homebrew, use
-`python3.14` (or any working 3.11+). See the note in the learning guide about
-the system `python3` (3.9) and a broken Homebrew 3.12 build on the development
-machine.
+You need Python 3.11 or newer.
 
 ```bash
-cd ~/chord-vs-pastry
-python3.14 -m venv .venv
+cd chord-vs-pastry
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run
+## How to run
 
 ```bash
 source .venv/bin/activate
-python -m pytest                                    # all tests
-python -m experiments.phase0_consistent_hashing_demo   # Phase 0 demo
-python -m experiments.phase1_network_demo              # Phase 1 demo
-python -m experiments.phase2_chord_demo                # Phase 2 demo
-python -m experiments.phase3_pastry_demo               # Phase 3 demo
+python -m pytest                                      # all tests (116)
+python -m experiments.phase0_consistent_hashing_demo  # modulo vs consistent hashing
+python -m experiments.phase1_network_demo             # ping times on the 3 topologies
+python -m experiments.phase2_chord_demo               # Chord results
+python -m experiments.phase3_pastry_demo              # Pastry results
+python -m experiments.midsem_graphs                   # graphs in experiments/results/midsem/
 ```
 
-## Reproducibility
-
-Every random choice comes from `sim.rng.make_rng(seed, "<stream-name>")`.
-The same seed always gives identical results. Nothing uses the global `random`
-module.
+All random numbers come from one seed, so running a script again gives the
+same numbers.
 
 ## Status
 
-See the work log at the top of [docs/LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md).
-# chord-vs-pastry
+Done: simulator, Chord, Pastry, tests, first graphs.
+Next: key-value store and churn, full experiments, report.
+More details are in [docs/LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md).
