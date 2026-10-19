@@ -1,0 +1,19 @@
+overlay,seed,stage,latency_mean_ms,success_pct,correct_pct
+Chord,1,Before crash,275.123,100.000,100.000
+Chord,1,Right after crash,1029.290,100.000,100.000
+Chord,1,60 s later,264.653,100.000,100.000
+Pastry (proximity-aware),1,Before crash,121.187,100.000,100.000
+Pastry (proximity-aware),1,Right after crash,530.254,100.000,100.000
+Pastry (proximity-aware),1,60 s later,134.933,100.000,100.000
+Chord,2,Before crash,285.104,100.000,100.000
+Chord,2,Right after crash,981.199,100.000,100.000
+Chord,2,60 s later,261.109,100.000,100.000
+Pastry (proximity-aware),2,Before crash,116.812,100.000,100.000
+Pastry (proximity-aware),2,Right after crash,587.748,100.000,100.000
+Pastry (proximity-aware),2,60 s later,123.968,100.000,100.000
+Chord,3,Before crash,280.496,100.000,100.000
+Chord,3,Right after crash,928.831,100.000,100.000
+Chord,3,60 s later,260.275,100.000,100.000
+Pastry (proximity-aware),3,Before crash,116.165,100.000,100.000
+Pastry (proximity-aware),3,Right after crash,517.623,100.000,100.000
+Pastry (proximity-aware),3,60 s later,129.984,100.000,100.000
