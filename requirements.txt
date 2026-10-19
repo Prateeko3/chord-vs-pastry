@@ -1,0 +1,7 @@
+# Pinned versions so every run of this project uses exactly the same libraries.
+# Install with:  pip install -r requirements.txt
+simpy==4.1.2        # discrete-event simulation engine (our "fake clock + event queue")
+numpy==2.5.4        # fast numeric arrays (used by pandas/matplotlib, and for stats)
+pandas==3.0.6       # tables of results -> CSV
+matplotlib==3.11.2  # plots (PNG)
+pytest==9.1.1       # test runner
